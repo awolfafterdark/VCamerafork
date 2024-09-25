@@ -1,0 +1,120 @@
+name: Android APK Build, QA, and Security Audit
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build and Test APK
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        build-type: [debug, release]  # Parallel build for both debug and release APKs
+        java-version: ['11']
+
+    env:
+      JAVA_HOME_11_X64: /usr/lib/jvm/java-11-openjdk-amd64
+      ANDROID_API_LEVEL: 33
+      ANDROID_BUILD_TOOLS_VERSION: "31.0.0"
+      MIN_SDK_VERSION: 24
+      TARGET_SDK_VERSION: 33
+      BUILD_TOOLS_VERSION: "31.0.0"
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.configureondemand=true"
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up JDK ${{ matrix.java-version }}
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'zulu'
+        java-version: ${{ matrix.java-version }}
+
+    - name: Set up Android SDK
+      uses: android-actions/setup-android@v2
+      with:
+        api-level: ${{ env.ANDROID_API_LEVEL }}
+        build-tools: ${{ env.BUILD_TOOLS_VERSION }}
+        ndk: 21.4.7075529
+
+    - name: Cache Gradle packages
+      uses: actions/cache@v2
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-
+
+    - name: Prepare Gradle Wrapper
+      run: |
+        chmod +x ./gradlew
+
+    - name: Build APK (Type: ${{ matrix.build-type }})
+      run: ./gradlew assemble${{ matrix.build-type | capitalize }} --stacktrace --no-daemon --max-workers=4
+      continue-on-error: false
+
+    - name: Verify Build Output (Type: ${{ matrix.build-type }})
+      run: |
+        APK_PATH=app/build/outputs/apk/${{ matrix.build-type }}/app-${{ matrix.build-type }}.apk
+        if [ ! -f $APK_PATH ]; then
+          echo "${{ matrix.build-type }} APK not found!"
+          exit 1
+        fi
+
+    - name: Upload APK (Type: ${{ matrix.build-type }})
+      uses: actions/upload-artifact@v3
+      with:
+        name: app-${{ matrix.build-type }}.apk
+        path: app/build/outputs/apk/${{ matrix.build-type }}/app-${{ matrix.build-type }}.apk
+
+    - name: Lint and Code Quality (Type: ${{ matrix.build-type }})
+      run: ./gradlew lint${{ matrix.build-type | capitalize }}
+
+    - name: Run Unit Tests
+      run: ./gradlew test --stacktrace --no-daemon
+
+    - name: Check APK size
+      run: |
+        APK_PATH=app/build/outputs/apk/${{ matrix.build-type }}/app-${{ matrix.build-type }}.apk
+        echo "${{ matrix.build-type }} APK Size:"
+        ls -lh $APK_PATH
+
+  security_audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Install Trivy
+      run: |
+        sudo apt-get install wget
+        wget https://github.com/aquasecurity/trivy/releases/download/v0.29.0/trivy_0.29.0_Linux-64bit.deb
+        sudo dpkg -i trivy_0.29.0_Linux-64bit.deb
+
+    - name: Security scan
+      run: trivy fs --severity HIGH,CRITICAL .
+
+  notifications:
+    name: Notification and Cleanup
+    runs-on: ubuntu-latest
+    needs: [build, security_audit]
+    if: always()  # Run no matter the result of previous jobs
+
+    steps:
+    - name: Send build notifications
+      run: |
+        if [ "${{ github.event_name }}" == "push" ]; then
+          curl -X POST -H 'Content-type: application/json' --data '{"text":"APK build complete! Review the artifacts."}' ${{ secrets.SLACK_WEBHOOK_URL }}
+        fi
+    - name: Clean up
+      run: ./gradlew clean
